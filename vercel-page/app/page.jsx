@@ -1,9 +1,9 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const DEFAULT_POST_URL = 'https://www.threads.com/@maslowkorea/post/DXoe55xj0NW?xmt=AQF0DSd8iVFHchwXKS0k2O3pD8XC4aFVEIqeUnhhyBA78G8bX9weBGEiiopEWEPBP2uXZ0wC&slof=1';
-const STORAGE_KEY = 'threads_video_vercel_state_v1';
+const STORAGE_KEY = 'threads_video_vercel_state_v2';
 const DEFAULT_API = process.env.NEXT_PUBLIC_SCRAPER_API_URL || '';
 
 function loadState() {
@@ -19,11 +19,14 @@ export default function Page() {
   const [postUrl, setPostUrl] = useState(DEFAULT_POST_URL);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API);
   const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState('대기 중');
+  const [serverRunning, setServerRunning] = useState(false);
+  const [serverError, setServerError] = useState('');
+  const [lastFinishedAt, setLastFinishedAt] = useState('');
+  const [status, setStatus] = useState('저장된 결과 불러오는 중...');
   const [filter, setFilter] = useState('ownerNone');
   const [localState, setLocalState] = useState({});
   const [maxScrolls, setMaxScrolls] = useState(80);
+  const timerRef = useRef(null);
 
   useEffect(() => {
     setLocalState(loadState());
@@ -31,19 +34,52 @@ export default function Page() {
     if (savedApi) setApiUrl(savedApi);
   }, []);
 
+  useEffect(() => {
+    if (!apiUrl) return;
+    refreshResults();
+    timerRef.current = setInterval(refreshResults, 10000);
+    return () => clearInterval(timerRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiUrl]);
+
   function updateLocal(id, patch) {
     const next = { ...localState, [id]: { ...(localState[id] || {}), ...patch, updatedAt: new Date().toISOString() } };
     setLocalState(next);
     saveState(next);
   }
 
-  async function scan() {
+  async function refreshResults() {
+    const base = apiUrl.trim().replace(/\/$/, '');
+    if (!base) return;
+    localStorage.setItem('scraper_api_url', base);
+    try {
+      const res = await fetch(`${base}/results`, { method: 'GET' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.detail || data?.message || `HTTP ${res.status}`);
+      setItems(Array.isArray(data.items) ? data.items : []);
+      setServerRunning(Boolean(data.running));
+      setServerError(data.lastError || '');
+      setLastFinishedAt(data.lastFinishedAt || '');
+      if (data.running) {
+        setStatus(`백그라운드 수집 중... 현재 저장된 영상 답글 ${data.videoReplyCount || 0}개 표시 중`);
+      } else if (data.lastError) {
+        setStatus(`마지막 수집 오류: ${data.lastError}`);
+      } else if (data.lastFinishedAt) {
+        setStatus(`마지막 수집 완료: ${data.lastFinishedAt} / 영상 답글 ${data.videoReplyCount || 0}개`);
+      } else {
+        setStatus('아직 저장된 수집 결과가 없다. 즉시 수집 요청을 한 번 누르면 뒤에서 긁기 시작한다.');
+      }
+    } catch (e) {
+      setStatus('결과 불러오기 실패: ' + e.message);
+      setServerError(e.message);
+    }
+  }
+
+  async function requestScan() {
     const base = apiUrl.trim().replace(/\/$/, '');
     if (!base) return alert('스크래핑 서버 주소를 넣어야 한다. 예: https://xxxxx.trycloudflare.com');
     localStorage.setItem('scraper_api_url', base);
-
-    setLoading(true);
-    setStatus('스크래핑 서버 호출 중...');
+    setStatus('즉시 수집 요청 보내는 중...');
     try {
       const res = await fetch(`${base}/scan`, {
         method: 'POST',
@@ -52,15 +88,13 @@ export default function Page() {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) throw new Error(data?.detail || data?.message || `HTTP ${res.status}`);
+      setServerRunning(Boolean(data.running));
       setItems(Array.isArray(data.items) ? data.items : []);
-      setStatus(`완료: 영상 답글 ${data.videoReplyCount || 0}개 / 대표 답글 없음 ${data.ownerNotRepliedCount || 0}개`);
-      setFilter('ownerNone');
+      setStatus(data.message || '백그라운드 수집을 시작했다. 기다리지 말고 저장된 결과가 자동 갱신된다.');
+      setTimeout(refreshResults, 1500);
     } catch (e) {
-      console.error(e);
-      setStatus('실패: ' + e.message);
+      setStatus('즉시 수집 요청 실패: ' + e.message);
       alert(e.message);
-    } finally {
-      setLoading(false);
     }
   }
 
@@ -93,28 +127,32 @@ export default function Page() {
       <section className="hero">
         <div className="box main">
           <h1>Threads 영상 답글함</h1>
-          <p className="sub">대표는 이 페이지에서 영상 달린 답글만 보고, 버튼을 눌러 Threads로 이동해서 직접 답글을 달면 된다.</p>
+          <p className="sub">대표는 이 페이지에서 이미 수집된 영상 답글만 바로 본다. 수집은 네 컴퓨터 Python 서버가 뒤에서 계속 한다.</p>
           <div className="target">
             <input value={postUrl} onChange={e => setPostUrl(e.target.value)} placeholder="Threads 게시글 링크" />
-            <button onClick={scan} disabled={loading}>{loading ? '스캔 중...' : '영상 있는 답글만 스캔'}</button>
+            <button onClick={requestScan} disabled={serverRunning}>{serverRunning ? '뒤에서 수집 중' : '즉시 수집 요청'}</button>
           </div>
           <div className="api">
             <input value={apiUrl} onChange={e => setApiUrl(e.target.value)} placeholder="스크래핑 서버 주소 예: https://xxxxx.trycloudflare.com" />
             <input style={{maxWidth:160}} type="number" value={maxScrolls} onChange={e => setMaxScrolls(e.target.value)} placeholder="스크롤" />
           </div>
-          <div className="small">기본 글은 @maslowkorea / DXoe55xj0NW. 스크래핑은 Vercel이 아니라 네 컴퓨터의 Python 서버가 한다.</div>
+          <div className="small">이 페이지는 기다리는 화면이 아니다. 10초마다 저장된 결과를 자동으로 새로고침한다.</div>
         </div>
         <div className="box side">
           <div>
             <div className="count">{counts.total}</div>
             <div className="muted">영상 답글</div>
           </div>
-          <button className="ghost" onClick={() => setItems([])}>화면 비우기</button>
+          <button className="ghost" onClick={refreshResults}>결과 새로고침</button>
         </div>
       </section>
 
       <section className="box status">
-        <div>{status}</div>
+        <div>
+          <div>{status}</div>
+          {lastFinishedAt && <div className="small">마지막 완료: {lastFinishedAt}</div>}
+          {serverError && <div className="small dangerText">서버 메시지: {serverError}</div>}
+        </div>
         <div className="chips">
           <span className="chip">전체 <b>{counts.total}</b></span>
           <span className="chip">대표 답글 없음 <b>{counts.ownerNone}</b></span>
@@ -134,7 +172,7 @@ export default function Page() {
       </div>
 
       <section className="cards">
-        {visible.length === 0 ? <div className="empty">표시할 영상 답글이 없다.</div> : visible.map(item => (
+        {visible.length === 0 ? <div className="empty">표시할 영상 답글이 없다. 뒤에서 수집이 끝나면 자동으로 나타난다.</div> : visible.map(item => (
           <VideoCard key={item.id} item={item} onUpdate={updateLocal} />
         ))}
       </section>
